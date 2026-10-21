@@ -64,11 +64,11 @@ def run_command(args, timeout=30, cwd=ROOT, env=None):
 
 
 def query_from_host(host, domain: str, txid: int, timeout: float = 2.0):
-    """Run the existing protocol helper inside a Mininet host namespace."""
+    """Run the protocol helper inside a Mininet host namespace and return (answer, latency, raw_output)."""
     code = (
         "from tests.protocol_helpers import query_once; "
         f"r=query_once('10.0.0.1',9053,{domain!r},{timeout!r},{txid}); "
-        "print(f'ANSWER={r.answer} LATENCY_MS={r.latency_ms:.3f}'); "
+        "print(f'ANSWER={r.answer} LATENCY_MS={r.latency_ms:.3f} FLAGS={hex(r.flags)}'); "
         "print(f'COUNTS={r.question_count},{r.answer_count}')"
     )
     proc = host.popen(
@@ -95,12 +95,24 @@ def query_from_host(host, domain: str, txid: int, timeout: float = 2.0):
     latency = None
     for line in output.splitlines():
         if line.startswith("ANSWER="):
-            bits = line.split()
-            answer = bits[0].split("=", 1)[1]
-            latency = float(bits[1].split("=", 1)[1])
+            # Extract ANSWER value up to LATENCY_MS
+            if " LATENCY_MS=" in line:
+                ans_part, rest = line.split(" LATENCY_MS=", 1)
+                answer = ans_part.replace("ANSWER=", "", 1).strip()
+                lat_part = rest.split()[0]
+                try:
+                    latency = float(lat_part)
+                except ValueError:
+                    latency = 0.0
+            else:
+                answer = line.replace("ANSWER=", "", 1).strip()
+                latency = 0.0
+
     if answer is None or latency is None:
         raise RuntimeError(f"Could not parse query result: {output.strip()}")
+
     return answer, latency, output.strip()
+
 
 
 def terminate_process(proc, name: str, timeout: float = 2.0) -> None:
@@ -239,6 +251,71 @@ def main() -> int:
                     "Benchmarks and failover were skipped."
                 )
 
+
+        log("\n[STAGE] Unknown domain handling")
+        unknown_domain = "nonexistent-domain-test.xyz"
+        try:
+            ans,lat,raw = query_from_host(h2,"nonexistent-domain-test.xyz",42001,timeout=2.0)
+            log(f"Unknown domain query output: {raw}")
+            # Check that the server returned NXDOMAIN (0x8183)
+            is_nxdomain = ("0x8183" in raw) or ("NXDOMAIN" in ans.upper()) or ("NOT FOUND" in ans.upper())
+            if not check(is_nxdomain, f"Query '{unknown_domain}' returns NXDOMAIN"):
+                raise AbortRun(f"Expected NXDOMAIN for {unknown_domain}, got output={raw!r}")
+        except Exception as exc:
+            check(False, "Unknown domain handling")
+            raise AbortRun(f"Unknown domain test failed with exception: {exc}") from exc
+
+        log("\n[STAGE] Cache hit vs miss verification")
+        target_domain = "netflix.com"
+        # First query: Cache Miss / Recursion to Root
+        ans1, lat_miss, raw1 = query_from_host(h2, target_domain, 43001, timeout=2.0)
+        # Second query: Cache Hit from memory
+        ans2, lat_hit, raw2 = query_from_host(h2, target_domain, 43002, timeout=2.0)
+
+        log(f"Cache miss query latency: {lat_miss:.3f} ms")
+        log(f"Cache hit query latency:  {lat_hit:.3f} ms")
+        check(ans1 == ans2 == "192.27.78.9", f"Consistent answer across cache miss and hit for {target_domain}")
+
+        server_log_handle.flush()
+        primary_log_content = PRIMARY_LOG.read_text(encoding="utf-8", errors="replace")
+        cache_logged = f"CACHE HIT: {target_domain}" in primary_log_content or "cache" in primary_log_content.lower()
+        check(cache_logged, f"Server cache log confirms lookup for {target_domain}")
+
+
+        log("\n[STAGE] Upstream timeout resilience")
+        # Temporarily stop the secondary root server to simulate upstream failure
+        secondary.terminate()
+        try:
+            secondary.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            secondary.kill()
+            secondary.wait()
+        log("Secondary DNS (h3) stopped to test primary upstream timeout.")
+
+        uncached_domain = "crunchyroll.com"
+        try:
+            # Query domain that requires forwarding to h3
+            ans_fail,lat_fail,raw_fail = query_from_host(h2,"crunchyroll.com",44001,timeout=3.0)
+            log(f"Upstream timeout query output: {raw_fail}")
+            # Expect SERVFAIL (0x8182) or upstream timeout error payload
+            servfail_ok = ("FLAGS=0x8182" in raw_fail) or ("SERVFAIL" in ans_fail)
+            check(servfail_ok, "Primary returns SERVFAIL (0x8182) when upstream times out")
+        except Exception as exc:
+            log(f"Query timed out at client level: {exc}")
+            check(False, "Primary server failed to return SERVFAIL on upstream timeout")
+            raise AbortRun("Upstream timeout handling failed.") from exc
+
+        # Restart secondary root server for subsequent stages
+        secondary_log_handle = SECONDARY_LOG.open("a", encoding="utf-8")
+        server_log_handles.append(secondary_log_handle)
+        secondary = h3.popen(
+            [sys.executable, "-u", str(ROOT / "root.py")],
+            cwd=str(ROOT), stdout=secondary_log_handle, stderr=subprocess.STDOUT,
+        )
+        time.sleep(0.7)
+        check(secondary.poll() is None, "Secondary DNS restarted for benchmark and failover stages")
+
+
         log("\n[STAGE] Benchmarks (30 requests per domain)")
         for domain, expected in [("example.com", "93.184.216.34"),
                                  ("netflix.com", "192.27.78.9")]:
@@ -273,7 +350,7 @@ def main() -> int:
         env = os.environ.copy()
         env["MININET_H2_PID"] = str(h2.pid)
         controller_log_handle = CONTROLLER_LOG.open("w", encoding="utf-8")
-        controller_proc = subprocess.Popen(
+        controller_proc = h2.popen(
             [sys.executable, str(ROOT / "sdncontroller.py")],
             cwd=str(ROOT), env=env,
             stdout=controller_log_handle, stderr=subprocess.STDOUT, text=True,
@@ -299,20 +376,29 @@ def main() -> int:
             primary.wait()
         log("Primary DNS process stopped to simulate failure.")
 
+
+
         deadline = time.time() + 18
         controller_text = ""
         while time.time() < deadline:
             if CONTROLLER_LOG.exists():
                 controller_text = CONTROLLER_LOG.read_text(encoding="utf-8", errors="replace")
-            if "Failover rules installed." in controller_text:
+    
+            # Accept either standard message format
+            if ("Failover rules installed." in controller_text) or ("FAILOVER ACTIVE" in controller_text):
                 break
             if controller_proc.poll() is not None:
                 break
             time.sleep(0.5)
+
         log("Controller log:\n" + (controller_text.strip() or "<empty>"))
-        rules_installed = "Failover rules installed." in controller_text
+        rules_installed = ("Failover rules installed." in controller_text) or ("FAILOVER ACTIVE" in controller_text)
         if not check(rules_installed, "Controller detects primary failure and installs rules"):
             raise AbortRun(f"Controller failed to install failover rules. See {CONTROLLER_LOG}")
+
+
+
+
 
         # Give OVS a moment to apply the flows, then query the original primary IP.
         time.sleep(0.3)

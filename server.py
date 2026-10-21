@@ -51,6 +51,7 @@ while True:
 
     # 2. Cache hit
     elif domain_requested in cache:
+        print(f"CACHE HIT: {domain_requested}",flush=True)
         cached_flags, cached_payload = cache[domain_requested]
         an_count = 1 if cached_flags == 0x8180 else 0
         resp_header = struct.pack("!HHHHHH", trans_id, cached_flags, 1, an_count, 0, 0)
